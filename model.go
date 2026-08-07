@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const (
 	repoSelectView viewState = iota
 	dashboardView
 	detailView
+	graphView
 )
 
 // model is the main Bubbletea model.
@@ -45,6 +47,27 @@ type model struct {
 	logContent       string
 	logOffset        int // byte offset for incremental log fetching
 	logViewport      viewport.Model
+
+	// Commit graph state.
+	graph          contribGrid
+	graphLoaded    bool
+	graphLoading   bool
+	graphTruncated bool
+	graphMode      int // 0 = this repo, 1 = whole workspace
+
+	// Workspace graph state.
+	wsGraph      contribGrid
+	wsCaches     map[string]repoCache
+	wsLoaded     bool
+	wsScanning   bool
+	wsDone       int
+	wsTotal      int
+	wsPartial    bool
+	wsRetryAfter time.Duration
+	wsTruncated  bool
+	wsErr        string
+	wsCancel     context.CancelFunc
+	wsEvents     <-chan scanEvent
 
 	// Repo selector state.
 	repos           []Repository
@@ -98,6 +121,23 @@ type repoListMsg struct {
 	err        error
 }
 
+type commitListMsg struct {
+	commits   []Commit
+	truncated bool
+	err       error
+}
+
+type workspaceScanStartedMsg struct {
+	events <-chan scanEvent
+	cancel context.CancelFunc
+}
+
+type scanProgressMsg struct {
+	event scanEvent
+}
+
+type scanChannelClosedMsg struct{}
+
 // --- Commands ---
 
 func tickCmd(interval time.Duration) tea.Cmd {
@@ -138,6 +178,42 @@ func fetchReposCmd(api *APIClient, workspace string, page int) tea.Cmd {
 	return func() tea.Msg {
 		repos, total, err := api.FetchRepositories(workspace, page)
 		return repoListMsg{repos: repos, totalCount: total, err: err}
+	}
+}
+
+// graphCutoff reaches back past the grid's first day, which is the Sunday on
+// or before the 365-day mark, so the leading partial week is populated.
+func graphCutoff() time.Time {
+	return localMidnight(time.Now()).AddDate(0, 0, -(graphDays + daysPerWeek))
+}
+
+func fetchCommitsCmd(api *APIClient, workspace, repo string) tea.Cmd {
+	return func() tea.Msg {
+		scan, err := api.FetchCommits(
+			context.Background(), workspace, repo, graphCutoff(), "", singleRepoMaxPages)
+		return commitListMsg{commits: scan.Commits, truncated: scan.Next != "", err: err}
+	}
+}
+
+func startWorkspaceScanCmd(api *APIClient, workspace string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithCancel(context.Background())
+		return workspaceScanStartedMsg{
+			events: scanWorkspace(ctx, api, workspace, graphCutoff()),
+			cancel: cancel,
+		}
+	}
+}
+
+// waitForScanEvent pulls one event and re-schedules itself, which is how a
+// long-running channel-based job streams progress into Bubbletea's loop.
+func waitForScanEvent(events <-chan scanEvent) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-events
+		if !ok {
+			return scanChannelClosedMsg{}
+		}
+		return scanProgressMsg{event: event}
 	}
 }
 
@@ -301,6 +377,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case commitListMsg:
+		m.graphLoading = false
+		if msg.err != nil {
+			m.errMsg = msg.err.Error()
+		} else {
+			m.errMsg = ""
+			m.graph = buildContribGrid(msg.commits, time.Now())
+			m.graphLoaded = true
+			m.graphTruncated = msg.truncated
+		}
+		return m, nil
+
+	case workspaceScanStartedMsg:
+		m.wsCancel = msg.cancel
+		m.wsEvents = msg.events
+		return m, waitForScanEvent(msg.events)
+
+	case scanProgressMsg:
+		return m.applyScanEvent(msg.event)
+
+	case scanChannelClosedMsg:
+		m.wsScanning = false
+		m.wsEvents = nil
+		m.wsCancel = nil
+		return m, nil
+
 	case stepLogMsg:
 		if msg.err != nil {
 			// Don't overwrite main error for log failures.
@@ -324,6 +426,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.state == repoSelectView {
 		return m.handleRepoSelectKey(msg)
+	}
+	if m.state == graphView {
+		return m.handleGraphKey(msg)
 	}
 
 	switch msg.String() {
@@ -363,6 +468,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if m.state == dashboardView {
 			return m.switchToDetail()
+		}
+
+	case "g":
+		if m.state == dashboardView {
+			return m.switchToGraph()
 		}
 
 	case "tab":
@@ -423,6 +533,115 @@ func (m model) switchToDetail() (tea.Model, tea.Cmd) {
 	return m, fetchDetailCmd(m.api, m.cfg.DefaultWorkspace, m.cfg.DefaultRepository, buildNum)
 }
 
+// applyScanEvent folds one repository's result into the workspace graph. The
+// grid is rebuilt at repo boundaries only: a repo's commits are applied whole
+// or not at all, so a failed scan can never leave a half-counted repository.
+func (m model) applyScanEvent(event scanEvent) (tea.Model, tea.Cmd) {
+	if event.Finished {
+		m.wsScanning = false
+		m.wsPartial = event.BudgetSpent
+		m.wsRetryAfter = event.RetryAfter
+		if event.Err != nil {
+			m.wsErr = event.Err.Error()
+		}
+		m.rebuildWorkspaceGraph()
+		return m, waitForScanEvent(m.wsEvents)
+	}
+
+	if event.Cache != nil {
+		if m.wsCaches == nil {
+			m.wsCaches = map[string]repoCache{}
+		}
+		m.wsCaches[event.Cache.UUID] = *event.Cache
+	}
+	if event.Truncated {
+		m.wsTruncated = true
+	}
+	if event.BudgetSpent {
+		m.wsPartial = true
+	}
+
+	m.wsDone = event.Done
+	m.wsTotal = event.Total
+	m.rebuildWorkspaceGraph()
+
+	return m, waitForScanEvent(m.wsEvents)
+}
+
+func (m *model) rebuildWorkspaceGraph() {
+	commits := commitsMatchingAuthors(m.wsCaches, m.cfg.authorEmailSet())
+	m.wsGraph = buildContribGrid(commits, time.Now())
+	m.wsLoaded = true
+}
+
+func (m model) handleGraphKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.cancelWorkspaceScan()
+		return m, tea.Quit
+
+	case "q", "esc", "backspace":
+		m.cancelWorkspaceScan()
+		return m.switchToDashboard()
+
+	case "tab":
+		m.graphMode = (m.graphMode + 1) % 2
+		m.errMsg = ""
+		if m.graphMode == 1 && !m.wsScanning && !m.wsLoaded {
+			return m.startWorkspaceScan()
+		}
+		return m, nil
+
+	case "r":
+		m.errMsg = ""
+		if m.graphMode == 1 {
+			if m.wsScanning {
+				return m, nil
+			}
+			return m.startWorkspaceScan()
+		}
+		m.graphLoading = true
+		return m, fetchCommitsCmd(m.api, m.cfg.DefaultWorkspace, m.cfg.DefaultRepository)
+	}
+
+	return m, nil
+}
+
+func (m model) startWorkspaceScan() (tea.Model, tea.Cmd) {
+	m.cancelWorkspaceScan()
+	m.wsScanning = true
+	m.wsPartial = false
+	m.wsTruncated = false
+	m.wsRetryAfter = 0
+	m.wsErr = ""
+	m.wsDone = 0
+	m.wsTotal = 0
+	return m, startWorkspaceScanCmd(m.api, m.cfg.DefaultWorkspace)
+}
+
+func (m *model) cancelWorkspaceScan() {
+	if m.wsCancel != nil {
+		m.wsCancel()
+		m.wsCancel = nil
+	}
+	m.wsScanning = false
+}
+
+// switchToGraph opens the commit heatmap, reusing history already fetched for
+// this repo. A year of commits costs many paginated requests and barely changes
+// minute to minute, so it is never part of the auto-refresh tick; `r` refetches.
+func (m model) switchToGraph() (tea.Model, tea.Cmd) {
+	m.state = graphView
+	m.errMsg = ""
+
+	if m.graphLoaded {
+		return m, nil
+	}
+
+	m.graphLoading = true
+	return m, fetchCommitsCmd(m.api, m.cfg.DefaultWorkspace, m.cfg.DefaultRepository)
+}
+
 func (m model) switchToDashboard() (tea.Model, tea.Cmd) {
 	m.state = dashboardView
 	m.pipeline = nil
@@ -479,6 +698,8 @@ func (m model) View() string {
 		return m.repoSelectViewRender()
 	case detailView:
 		return m.detailViewRender()
+	case graphView:
+		return m.graphViewRender()
 	default:
 		return m.dashboardViewRender()
 	}

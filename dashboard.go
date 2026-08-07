@@ -139,7 +139,7 @@ func (m model) dashboardViewRender() string {
 	b.WriteString("\n\n")
 
 	// Help.
-	help := helpStyle.Render("↑/↓/j/k navigate • enter view • r refresh • esc back • q quit")
+	help := helpStyle.Render("↑/↓/j/k navigate • enter view • g graph • r refresh • esc back • q quit")
 	b.WriteString(help)
 
 	return b.String()

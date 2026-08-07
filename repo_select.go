@@ -196,6 +196,8 @@ func (m model) selectRepoFromList() (tea.Model, tea.Cmd) {
 	m.dashTable = newDashboardTable()
 	m.loading = true
 	m.errMsg = ""
+	m.graph = contribGrid{}
+	m.graphLoaded = false
 
 	if m.width > 0 {
 		m.dashTable.SetWidth(m.width)
