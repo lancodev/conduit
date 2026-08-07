@@ -1,18 +1,31 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const bitbucketAPI = "https://api.bitbucket.org/2.0"
+
+const (
+	commitPageLen = 100
+	// commitChunkPages is how much history a caller walks per budget
+	// reservation. Small chunks let a workspace scan share its request budget
+	// fairly instead of one enormous repo reserving it all up front.
+	commitChunkPages = 20
+	// singleRepoMaxPages bounds the one-repo graph, which has no shared budget
+	// to answer to. At 100 commits per page this covers 200k commits a year.
+	singleRepoMaxPages = 2000
+)
 
 // APIClient manages Bitbucket API calls and OAuth tokens.
 type APIClient struct {
@@ -91,8 +104,24 @@ func (c *APIClient) ensureToken() error {
 	return nil
 }
 
+// rateLimitError reports an HTTP 429 so callers can pause rather than retry.
+type rateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("rate limited by Bitbucket, retry in %s", e.RetryAfter)
+}
+
 // doGet performs an authenticated GET request and returns the response body.
 func (c *APIClient) doGet(endpoint string) ([]byte, error) {
+	return c.doGetCtx(context.Background(), endpoint)
+}
+
+// doGetCtx is doGet with cancellation, translating 429 into a rateLimitError
+// so a caller fanning out across many repos can stop instead of retrying into
+// a deeper rate-limit hole.
+func (c *APIClient) doGetCtx(ctx context.Context, endpoint string) ([]byte, error) {
 	if err := c.ensureToken(); err != nil {
 		return nil, err
 	}
@@ -101,7 +130,7 @@ func (c *APIClient) doGet(endpoint string) ([]byte, error) {
 	token := c.accessToken
 	c.mu.Unlock()
 
-	req, err := http.NewRequest("GET", endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -118,6 +147,10 @@ func (c *APIClient) doGet(endpoint string) ([]byte, error) {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &rateLimitError{RetryAfter: retryAfter(resp.Header)}
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(data))
 	}
@@ -125,10 +158,20 @@ func (c *APIClient) doGet(endpoint string) ([]byte, error) {
 	return data, nil
 }
 
+func retryAfter(h http.Header) time.Duration {
+	if v := h.Get("Retry-After"); v != "" {
+		if seconds, err := strconv.Atoi(v); err == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
 // --- JSON response types ---
 
 // Repository represents a Bitbucket repository.
 type Repository struct {
+	UUID      string            `json:"uuid"`
 	Slug      string            `json:"slug"`
 	Name      string            `json:"name"`
 	FullName  string            `json:"full_name"`
@@ -192,6 +235,36 @@ type PipelineName struct {
 	DisplayName string `json:"display_name,omitempty"`
 }
 
+// Commit represents a Bitbucket commit.
+type Commit struct {
+	Hash    string       `json:"hash"`
+	Date    time.Time    `json:"date"`
+	Message string       `json:"message"`
+	Author  CommitAuthor `json:"author"`
+}
+
+// CommitAuthor holds commit authorship. User is nil when the git identity
+// doesn't map to a Bitbucket account, so Raw is the reliable fallback.
+type CommitAuthor struct {
+	Raw  string         `json:"raw"`
+	User *BitbucketUser `json:"user,omitempty"`
+}
+
+// BitbucketUser holds the account linked to a commit author.
+type BitbucketUser struct {
+	DisplayName string `json:"display_name"`
+	Nickname    string `json:"nickname"`
+}
+
+// CommitListResponse is the API response for listing commits. The commits
+// endpoint uses iterator pagination: only Next is meaningful, there is no
+// reliable page/size to compute a total from.
+type CommitListResponse struct {
+	Values  []Commit `json:"values"`
+	Next    string   `json:"next"`
+	Pagelen int      `json:"pagelen"`
+}
+
 // Step represents a pipeline step.
 type Step struct {
 	UUID     string        `json:"uuid"`
@@ -226,6 +299,14 @@ func stepLogURL(workspace, repo string, buildNum int, stepUUID string) string {
 	encoded := url.PathEscape(stepUUID)
 	return fmt.Sprintf("%s/repositories/%s/%s/pipelines/%d/steps/%s/log",
 		bitbucketAPI, workspace, repo, buildNum, encoded)
+}
+
+// commitsURL requests only the fields the heatmap needs. Commit messages
+// dominate the payload and are never displayed, so dropping them keeps a
+// 127-repo scan's parsing and bandwidth cost down.
+func commitsURL(workspace, repo string) string {
+	return fmt.Sprintf("%s/repositories/%s/%s/commits?pagelen=%d&fields=next,values.hash,values.date,values.author.raw",
+		bitbucketAPI, workspace, repo, commitPageLen)
 }
 
 // FetchPipelines fetches the most recent pipelines.
@@ -271,6 +352,121 @@ func (c *APIClient) FetchSteps(workspace, repo string, buildNum int) ([]Step, er
 	}
 
 	return resp.Values, nil
+}
+
+// CommitScan is the result of walking part of one repository's history.
+//
+// Next is non-empty when the page limit stopped the walk with history still
+// unread; pass it back as resume to continue. A caller that abandons a
+// non-empty Next has an incomplete window and must say so, because a heatmap
+// missing commits looks confidently wrong rather than obviously broken.
+type CommitScan struct {
+	Commits  []Commit
+	Requests int
+	Next     string
+}
+
+// FetchCommits fetches commits made on or after cutoff, across all branches.
+//
+// Bitbucket paginates this endpoint with an opaque "next" URL rather than page
+// numbers, and offers no server-side date filter, so the cutoff is applied here
+// while walking. Commits arrive newest-first but merges can interleave slightly
+// older ones, so the walk only stops once an entire page predates the cutoff
+// rather than on the first old commit.
+func (c *APIClient) FetchCommits(
+	ctx context.Context,
+	workspace, repo string,
+	cutoff time.Time,
+	resume string,
+	maxPages int,
+) (CommitScan, error) {
+	var scan CommitScan
+
+	endpoint := resume
+	if endpoint == "" {
+		endpoint = commitsURL(workspace, repo)
+	}
+
+	for endpoint != "" {
+		if scan.Requests >= maxPages {
+			scan.Next = endpoint
+			break
+		}
+
+		data, err := c.doGetCtx(ctx, endpoint)
+		scan.Requests++
+		if err != nil {
+			return scan, err
+		}
+
+		var resp CommitListResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return scan, fmt.Errorf("decoding commits: %w", err)
+		}
+
+		if len(resp.Values) == 0 {
+			break
+		}
+
+		inRange := 0
+		for _, commit := range resp.Values {
+			if commit.Date.Before(cutoff) {
+				continue
+			}
+			scan.Commits = append(scan.Commits, commit)
+			inRange++
+		}
+
+		if inRange == 0 {
+			break
+		}
+
+		endpoint = resp.Next
+	}
+
+	return scan, nil
+}
+
+// FetchActiveRepositories returns repos touched on or after cutoff.
+//
+// Results are sorted by updated_on descending so the walk can stop at the first
+// stale repo instead of paging the whole workspace. Any commit bumps
+// updated_on, so this prunes dormant repos without ever dropping one that has
+// commits in the window.
+func (c *APIClient) FetchActiveRepositories(ctx context.Context, workspace string, cutoff time.Time) ([]Repository, error) {
+	endpoint := fmt.Sprintf(
+		"%s/repositories/%s?pagelen=100&sort=-updated_on&fields=next,values.uuid,values.full_name,values.slug,values.updated_on",
+		bitbucketAPI, workspace)
+
+	var active []Repository
+
+	for endpoint != "" {
+		data, err := c.doGetCtx(ctx, endpoint)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp RepositoryListResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("decoding repositories: %w", err)
+		}
+
+		if len(resp.Values) == 0 {
+			break
+		}
+
+		for _, repo := range resp.Values {
+			updated, err := time.Parse(time.RFC3339Nano, repo.UpdatedOn)
+			if err != nil || updated.Before(cutoff) {
+				return active, nil
+			}
+			active = append(active, repo)
+		}
+
+		endpoint = resp.Next
+	}
+
+	return active, nil
 }
 
 // FetchRepositories fetches repositories for a workspace, paginated.
