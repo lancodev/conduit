@@ -14,6 +14,16 @@ var (
 	colorMagenta = lipgloss.Color("#F5BDE6")
 )
 
+// Contribution heatmap colors, from GitHub's dark theme. Level 0 is lightened
+// from GitHub's #161B22 so empty cells stay visible against a dark terminal.
+var (
+	colorContrib0 = lipgloss.Color("#2D333B")
+	colorContrib1 = lipgloss.Color("#0E4429")
+	colorContrib2 = lipgloss.Color("#006D32")
+	colorContrib3 = lipgloss.Color("#26A641")
+	colorContrib4 = lipgloss.Color("#39D353")
+)
+
 // Status icons.
 const (
 	iconSuccess    = "✔"
@@ -98,6 +108,33 @@ var (
 	repoCursorStyle = lipgloss.NewStyle().
 			Foreground(colorBlue).
 			Bold(true)
+)
+
+// Commit graph styles.
+var (
+	contribStyles = [5]lipgloss.Style{
+		lipgloss.NewStyle().Foreground(colorContrib0),
+		lipgloss.NewStyle().Foreground(colorContrib1),
+		lipgloss.NewStyle().Foreground(colorContrib2),
+		lipgloss.NewStyle().Foreground(colorContrib3),
+		lipgloss.NewStyle().Foreground(colorContrib4),
+	}
+
+	monthLabelStyle = lipgloss.NewStyle().
+			Foreground(colorSubtle)
+
+	dayLabelStyle = lipgloss.NewStyle().
+			Foreground(colorDim)
+
+	statLabelStyle = lipgloss.NewStyle().
+			Foreground(colorSubtle)
+
+	statValueStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(colorWhite)
+
+	warnStyle = lipgloss.NewStyle().
+			Foreground(colorYellow)
 )
 
 // statusIcon returns the icon and style for a given pipeline/step state.
