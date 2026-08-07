@@ -15,13 +15,13 @@ A terminal UI for monitoring [Bitbucket Cloud](https://bitbucket.org/) pipelines
 ### Homebrew
 
 ```bash
-brew install kylekanderson/tap/conduit
+brew install lancodev/tap/conduit
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/kylekanderson/conduit.git
+git clone https://github.com/lancodev/conduit.git
 cd conduit
 go build -o conduit .
 ```

@@ -1,4 +1,4 @@
-module github.com/kylekanderson/conduit
+module github.com/lancodev/conduit
 
 go 1.26.1
 
