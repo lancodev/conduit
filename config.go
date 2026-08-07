@@ -17,6 +17,23 @@ type Config struct {
 	RefreshInterval   int        `yaml:"refresh_interval"`
 	Auth              AuthConfig `yaml:"auth"`
 	Favorites         []string   `yaml:"favorites,omitempty"`
+	AuthorEmails      []string   `yaml:"author_emails,omitempty"`
+}
+
+// authorEmailSet returns the configured identities, lowercased for matching.
+// Bitbucket's client_credentials grant has no end-user identity, so the
+// workspace graph can only know whose commits to count by being told here.
+func (c Config) authorEmailSet() map[string]bool {
+	if len(c.AuthorEmails) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(c.AuthorEmails))
+	for _, email := range c.AuthorEmails {
+		if trimmed := strings.TrimSpace(strings.ToLower(email)); trimmed != "" {
+			set[trimmed] = true
+		}
+	}
+	return set
 }
 
 // AuthConfig holds OAuth credentials.
