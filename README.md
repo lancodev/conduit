@@ -18,6 +18,22 @@ A terminal UI for monitoring [Bitbucket Cloud](https://bitbucket.org/) pipelines
 brew install lancodev/tap/conduit
 ```
 
+### Prebuilt binaries
+
+Download a Linux or macOS (amd64/arm64) archive from the
+[releases page](https://github.com/lancodev/conduit/releases), extract it, and
+put `conduit` somewhere on your `PATH`.
+
+### Arch Linux
+
+An AUR package is planned. Until then, build it with the bundled PKGBUILD:
+
+```bash
+git clone https://github.com/lancodev/conduit.git
+cd conduit/packaging/arch
+makepkg -si
+```
+
 ### From source
 
 ```bash
@@ -152,7 +168,8 @@ that affordable:
   `updated_on` and the walk stops at the cutoff. In a 580-repo workspace that
   typically leaves ~130 to consider.
 - **Unchanged repos cost zero requests.** Each repo's commits are cached under
-  `~/Library/Caches/conduit` (or `$XDG_CACHE_HOME`), keyed by repo UUID. On a
+  your user cache directory (`~/.cache/conduit` on Linux, or `$XDG_CACHE_HOME`;
+  `~/Library/Caches/conduit` on macOS), keyed by repo UUID. On a
   rescan, any repo whose `updated_on` is unchanged is served from disk.
 
 In practice a first scan of ~128 repos takes about four minutes; a rescan takes

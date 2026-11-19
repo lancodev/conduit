@@ -1,0 +1,47 @@
+# Maintainer: lancodev <https://github.com/lancodev>
+pkgname=conduit-tui
+_pkgname=conduit
+pkgver=0.2.1
+pkgrel=1
+pkgdesc='TUI for monitoring Bitbucket Cloud pipelines'
+arch=('x86_64' 'aarch64')
+url='https://github.com/lancodev/conduit'
+license=('MIT')
+depends=('glibc')
+makedepends=('go')
+# Installs /usr/bin/conduit, which clashes with the Matrix server package.
+conflicts=('conduit' 'conduit-tui-bin')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Run `updpkgsums` after tagging v$pkgver.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$_pkgname-$pkgver"
+  export GOPATH="$srcdir/gopath"
+  go mod download -modcacherw
+}
+
+build() {
+  cd "$_pkgname-$pkgver"
+  export GOPATH="$srcdir/gopath"
+  export CGO_CPPFLAGS="$CPPFLAGS"
+  export CGO_CFLAGS="$CFLAGS"
+  export CGO_CXXFLAGS="$CXXFLAGS"
+  export CGO_LDFLAGS="$LDFLAGS"
+  export GOFLAGS='-buildmode=pie -trimpath -mod=readonly -modcacherw'
+  go build \
+    -ldflags "-linkmode=external -X main.version=$pkgver" \
+    -o "$_pkgname" .
+}
+
+check() {
+  cd "$_pkgname-$pkgver"
+  ./"$_pkgname" --version
+}
+
+package() {
+  cd "$_pkgname-$pkgver"
+  install -Dm755 "$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

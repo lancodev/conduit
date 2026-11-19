@@ -9,8 +9,17 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	args := os.Args[1:]
+
+	// Handle --version / -v.
+	if len(args) > 0 && (args[0] == "--version" || args[0] == "-v") {
+		fmt.Println("conduit " + version)
+		return
+	}
 
 	// Handle auth subcommand.
 	if len(args) > 0 && args[0] == "auth" {
@@ -100,6 +109,7 @@ Options:
   -r workspace/repo    Override workspace and repository
   -i seconds           Refresh interval (default: 10)
   -h, --help           Show this help
+  -v, --version        Show version
 
 Environment variables (override config file):
   CONDUIT_CLIENT_ID       Bitbucket OAuth Client ID

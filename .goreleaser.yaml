@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go vet ./...
+
+builds:
+  - id: conduit
+    binary: conduit
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: conduit
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native
+
+release:
+  # Keep hand-written release notes if a release already exists for the tag.
+  mode: keep-existing
+
+# Prebuilt AUR package. Generated into dist/ on every release but not pushed
+# until AUR registration reopens. To enable:
+#   1. Create the AUR account and the empty conduit-tui-bin repo.
+#   2. Add the account's private SSH key as the AUR_KEY repo secret.
+#   3. Set skip_upload to false.
+aurs:
+  - name: conduit-tui-bin
+    homepage: https://github.com/lancodev/conduit
+    description: TUI for monitoring Bitbucket Cloud pipelines
+    maintainers:
+      - "lancodev <https://github.com/lancodev>"
+    license: MIT
+    provides: [conduit-tui]
+    conflicts: [conduit, conduit-tui]
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: ssh://aur@aur.archlinux.org/conduit-tui-bin.git
+    skip_upload: true
+    package: |-
+      install -Dm755 ./conduit "${pkgdir}/usr/bin/conduit"
+      install -Dm644 ./LICENSE "${pkgdir}/usr/share/licenses/conduit-tui-bin/LICENSE"
+      install -Dm644 ./README.md "${pkgdir}/usr/share/doc/conduit-tui-bin/README.md"
