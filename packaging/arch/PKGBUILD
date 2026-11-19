@@ -12,8 +12,8 @@ makedepends=('go')
 # Installs /usr/bin/conduit, which clashes with the Matrix server package.
 conflicts=('conduit' 'conduit-tui-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Run `updpkgsums` after tagging v$pkgver.
-sha256sums=('SKIP')
+# After bumping pkgver, run `updpkgsums` to refresh this.
+sha256sums=('6e77165d5da3152dbc052d530089c161b1ce55b8cff03639364bd2cca7e1f6e1')
 
 prepare() {
   cd "$_pkgname-$pkgver"
